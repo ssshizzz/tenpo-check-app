@@ -351,7 +351,7 @@ export default function App() {
           </select>
 
           <label style={styles.label}>担当者</label>
-          <input value={staffName} onChange={(e) => setStaffName(e.target.value)} placeholder="例：柴田" style={styles.input} disabled={isSending} />
+          <input value={staffName} onChange={(e) => setStaffName(e.target.value)} placeholder="フルネームでお願いします" style={styles.input} disabled={isSending} />
         </div>
 
         {checkType === "daily" ? (
