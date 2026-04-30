@@ -1,15 +1,27 @@
+// 店舗チェック・修繕管理 MVP
+// Google Apps Script / Code.js
+
+// 画像格納フォルダ
 const FOLDER_ID = "1r5_Jhg1HnFaOGlXHkhYrvJZmxYN8Na4K";
+
+// 店舗マスタファイル
+const MASTER_SHEET_ID = "1uxbE4Ei_fC3ETnKiFMKlb2bvC2tABzzHUswTpMmFEzA";
+const STORE_MASTER_SHEET_NAME = "店舗マスタ";
+
+// 日次・週次ファイル
 const DAILY_SHEET_ID = "1PQvFFSRr4tn_gs4nHSseWeSicHsDObwogDXKHUlOGPo";
 const WEEKLY_SHEET_ID = "1aRFwmNY7xCUwD999jITQsRZA9oOlpUATngGI2WOFfUI";
+
+// 修繕管理ファイル
 const REPAIR_SHEET_ID = "1vXevJBB-2UVZSFyD__rhXtauwGnM-5nq8R5ua3kz6XY";
 
+// 設定シート
 const SETTING_SHEET_NAME = "設定";
-const SETTING_URGENCY_CELL = "A1";
-const SETTING_DAILY_STATUS_CELL = "B1";
-const SETTING_REPAIR_STATUS_CELL = "C1";
-const DEFAULT_REPAIR_STATUS = "未対応";
+const SETTING_GRADE_CELL = "A1";          // S/A/B/C
+const SETTING_DAILY_STATUS_CELL = "B1";   // OK/NG
+const SETTING_REPAIR_STATUS_CELL = "C1";  // 未対応/対応中/完了
 
-const DAILY_HEADERS = [
+const DAILY_HEADER = [
   "チェックID",
   "修繕へ登録ID",
   "日時",
@@ -31,7 +43,7 @@ const DAILY_HEADERS = [
   "備考",
 ];
 
-const WEEKLY_HEADERS = [
+const WEEKLY_HEADER = [
   "チェックID",
   "修繕へ登録ID",
   "日時",
@@ -52,481 +64,703 @@ const WEEKLY_HEADERS = [
   "備考",
 ];
 
-const REPAIR_HEADERS = [
+const REPAIR_HEADER = [
   "修繕ID",
   "元チェックID",
-  "チェック種別",
   "登録日時",
   "発生日",
   "店舗名",
   "担当者",
+  "チェック種別",
   "内容",
-  "写真ファイル名",
-  "画像URL",
+  "写真URL",
   "サムネイル",
-  "緊急度",
-  "総合評価",
+  "優先度",
   "対応ステータス",
   "対応期限",
-  "対応完了日",
   "対応担当者",
   "対応内容",
+  "完了日",
   "備考",
 ];
 
 function doGet(e) {
   try {
-    const action = e.parameter.action;
-    if (action === "getSettings") return getSettingsResponse(e);
-    return createJsonResponse({ ok: false, error: "不明なactionです" });
-  } catch (error) {
-    return createJsonResponse({ ok: false, error: error.message });
-  }
-}
+    const action = e.parameter.action || "";
 
-function doPost(e) {
-  try {
-    const data = JSON.parse(e.postData.contents);
-    const result = saveCheck(data);
-    return createJsonResponse({ ok: true, ...result });
+    if (action === "getSettings") {
+      return getSettingsResponse(e);
+    }
+
+    return createJsonResponse({
+      ok: false,
+      error: "不明なactionです: " + action,
+    });
   } catch (error) {
-    return createJsonResponse({ ok: false, error: error.message });
+    return createJsonResponse({
+      ok: false,
+      error: error.message,
+    });
   }
 }
 
 function getSettingsResponse(e) {
-  const settings = buildSettingsPayload();
-  const json = JSON.stringify({ ok: true, ...settings });
+  const payload = {
+    ok: true,
+    settings: buildSettingsPayload(),
+  };
+
   const callback = e.parameter.callback;
+  const json = JSON.stringify(payload);
+
+  // iPhone/VercelからCORSを避けて取得するためJSONP対応
   if (callback) {
     return ContentService
       .createTextOutput(callback + "(" + json + ");")
       .setMimeType(ContentService.MimeType.JAVASCRIPT);
   }
-  return createJsonResponse({ ok: true, ...settings });
+
+  return createJsonResponse(payload);
 }
 
 function buildSettingsPayload() {
   const dailySS = SpreadsheetApp.openById(DAILY_SHEET_ID);
   const weeklySS = SpreadsheetApp.openById(WEEKLY_SHEET_ID);
-  const repairSS = SpreadsheetApp.openById(REPAIR_SHEET_ID);
-  const stores = uniqueValues([
-    ...getStoreNamesFromSpreadsheet(dailySS),
-    ...getStoreNamesFromSpreadsheet(weeklySS),
-    ...getStoreNamesFromSpreadsheet(repairSS),
-    ...getSettingColumnValues(dailySS, "店舗名"),
-    ...getSettingColumnValues(weeklySS, "店舗名"),
-  ]).filter((name) => name !== SETTING_SHEET_NAME);
 
   return {
-    stores,
+    storeMaster: getStoreMasterRecords(),
     dailyCheckOptions: getValidationValues(dailySS, SETTING_DAILY_STATUS_CELL, ["OK", "NG"]),
-    weeklyGradeOptions: getValidationValues(weeklySS, SETTING_URGENCY_CELL, ["S", "A", "B", "C"]),
-    urgencyOptions: getValidationValues(dailySS, SETTING_URGENCY_CELL, ["S", "A", "B", "C"]).filter((value) => value !== "D"),
+    weeklyGradeOptions: getValidationValues(weeklySS, SETTING_GRADE_CELL, ["S", "A", "B", "C"]),
+    urgencyOptions: getValidationValues(dailySS, SETTING_GRADE_CELL, ["S", "A", "B", "C"]),
     repairStatusOptions: getValidationValues(dailySS, SETTING_REPAIR_STATUS_CELL, ["未対応", "対応中", "完了"]),
   };
 }
 
-function saveCheck(data) {
-  const checkType = normalizeCheckType(data.checkType);
-  const storeName = requiredText(data.storeName, "店舗名");
-  const staffName = requiredText(data.staffName, "担当者");
-  const memo = String(data.memo || "").trim();
-  const note = String(data.note || "").trim();
-  const now = new Date();
-  const checkId = makeId(checkType === "daily" ? "D" : "W", now);
+function getStoreMasterRecords() {
+  const ss = SpreadsheetApp.openById(MASTER_SHEET_ID);
+  const sheet = ss.getSheetByName(STORE_MASTER_SHEET_NAME);
 
-  const imageInfo = saveImageIfPresent(data, checkType, storeName, checkId);
-  const calculation = checkType === "daily"
-    ? calculateDaily(data.dailyChecks || {})
-    : calculateWeekly(data.weeklyChecks || {});
-
-  const shouldRepair = shouldCreateRepair(checkType, calculation, memo, imageInfo.hasImage);
-  let repairId = "";
-  let repairDeadline = "";
-
-  if (shouldRepair) {
-    repairId = makeId("R", now);
-    repairDeadline = calculateDeadline(calculation.urgency, now);
-    appendRepairRow({
-      repairId,
-      checkId,
-      checkType,
-      now,
-      storeName,
-      staffName,
-      memo,
-      note,
-      fileName: imageInfo.fileName,
-      fileUrl: imageInfo.fileUrl,
-      thumbnailFormula: imageInfo.thumbnailFormula,
-      urgency: calculation.urgency,
-      evaluation: calculation.evaluation,
-      deadline: repairDeadline,
-    });
+  if (!sheet) {
+    throw new Error("店舗マスタシートが見つかりません: " + STORE_MASTER_SHEET_NAME);
   }
 
-  if (checkType === "daily") {
-    appendDailyRow({
-      checkId,
-      repairId,
-      now,
-      storeName,
-      staffName,
-      checks: data.dailyChecks || {},
-      evaluation: calculation.evaluation,
-      urgency: calculation.urgency,
-      imageInfo,
-      memo,
-      status: repairId ? DEFAULT_REPAIR_STATUS : "",
-      deadline: repairDeadline,
-      note,
-    });
-  } else {
-    appendWeeklyRow({
-      checkId,
-      repairId,
-      now,
-      storeName,
-      staffName,
-      checks: data.weeklyChecks || {},
-      evaluation: calculation.evaluation,
-      urgency: calculation.urgency,
-      imageInfo,
-      memo,
-      status: repairId ? DEFAULT_REPAIR_STATUS : "",
-      deadline: repairDeadline,
-      note,
-    });
-  }
-
-  return {
-    checkId,
-    repairId,
-    checkType,
-    storeName,
-    evaluation: calculation.evaluation,
-    urgency: calculation.urgency,
-    repaired: Boolean(repairId),
-    fileUrl: imageInfo.fileUrl,
-  };
-}
-
-function appendDailyRow(payload) {
-  const ss = SpreadsheetApp.openById(DAILY_SHEET_ID);
-  const sheet = getOrCreateStoreSheet(ss, payload.storeName);
-  ensureCheckHeader(sheet, DAILY_HEADERS, "daily");
-  const row = sheet.getLastRow() + 1;
-  sheet.getRange(row, 1, 1, DAILY_HEADERS.length).setValues([[
-    payload.checkId,
-    payload.repairId,
-    payload.now,
-    payload.storeName,
-    payload.staffName,
-    payload.checks.toilet || "",
-    payload.checks.seats || "",
-    payload.checks.kitchen || "",
-    payload.checks.entrance || "",
-    payload.evaluation,
-    payload.urgency,
-    payload.imageInfo.fileName,
-    payload.memo,
-    payload.imageInfo.fileUrl ? "画像を開く" : "",
-    payload.imageInfo.thumbnailFormula,
-    payload.status,
-    payload.deadline,
-    "",
-    payload.note,
-  ]]);
-  applyImageRichText(sheet, row, 14, payload.imageInfo.fileUrl);
-  styleInsertedRow(sheet, row, DAILY_HEADERS.length);
-}
-
-function appendWeeklyRow(payload) {
-  const ss = SpreadsheetApp.openById(WEEKLY_SHEET_ID);
-  const sheet = getOrCreateStoreSheet(ss, payload.storeName);
-  ensureCheckHeader(sheet, WEEKLY_HEADERS, "weekly");
-  const row = sheet.getLastRow() + 1;
-  sheet.getRange(row, 1, 1, WEEKLY_HEADERS.length).setValues([[
-    payload.checkId,
-    payload.repairId,
-    payload.now,
-    payload.storeName,
-    payload.staffName,
-    payload.checks.equipment || "",
-    payload.checks.interior || "",
-    payload.checks.flow || "",
-    payload.evaluation,
-    payload.urgency,
-    payload.imageInfo.fileName,
-    payload.memo,
-    payload.imageInfo.fileUrl ? "画像を開く" : "",
-    payload.imageInfo.thumbnailFormula,
-    payload.status,
-    payload.deadline,
-    "",
-    payload.note,
-  ]]);
-  applyImageRichText(sheet, row, 13, payload.imageInfo.fileUrl);
-  styleInsertedRow(sheet, row, WEEKLY_HEADERS.length);
-}
-
-function appendRepairRow(payload) {
-  const ss = SpreadsheetApp.openById(REPAIR_SHEET_ID);
-  const sheet = getOrCreateStoreSheet(ss, payload.storeName);
-  ensureRepairHeader(sheet);
-  const row = sheet.getLastRow() + 1;
-  sheet.getRange(row, 1, 1, REPAIR_HEADERS.length).setValues([[
-    payload.repairId,
-    payload.checkId,
-    payload.checkType === "daily" ? "日次" : "週次",
-    payload.now,
-    payload.now,
-    payload.storeName,
-    payload.staffName,
-    payload.memo,
-    payload.fileName,
-    payload.fileUrl ? "画像を開く" : "",
-    payload.thumbnailFormula,
-    payload.urgency,
-    payload.evaluation,
-    DEFAULT_REPAIR_STATUS,
-    payload.deadline,
-    "",
-    "",
-    "",
-    payload.note,
-  ]]);
-  applyImageRichText(sheet, row, 10, payload.fileUrl);
-  styleInsertedRow(sheet, row, REPAIR_HEADERS.length);
-}
-
-function ensureCheckHeader(sheet, headers, type) {
-  ensureHeader(sheet, headers);
-  const ss = sheet.getParent();
-  if (type === "daily") {
-    copyValidationAndFormat(ss, SETTING_DAILY_STATUS_CELL, sheet.getRange(2, 6, Math.max(sheet.getMaxRows() - 1, 1), 4));
-    copyValidationAndFormat(ss, SETTING_URGENCY_CELL, sheet.getRange(2, 10, Math.max(sheet.getMaxRows() - 1, 1), 2));
-    copyValidationAndFormat(ss, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 16, Math.max(sheet.getMaxRows() - 1, 1), 1));
-  } else {
-    copyValidationAndFormat(ss, SETTING_URGENCY_CELL, sheet.getRange(2, 6, Math.max(sheet.getMaxRows() - 1, 1), 5));
-    copyValidationAndFormat(ss, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 15, Math.max(sheet.getMaxRows() - 1, 1), 1));
-  }
-}
-
-function ensureRepairHeader(sheet) {
-  ensureHeader(sheet, REPAIR_HEADERS);
-  const ss = sheet.getParent();
-  copyValidationAndFormat(ss, SETTING_URGENCY_CELL, sheet.getRange(2, 12, Math.max(sheet.getMaxRows() - 1, 1), 2));
-  copyValidationAndFormat(ss, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 14, Math.max(sheet.getMaxRows() - 1, 1), 1));
-}
-
-function ensureHeader(sheet, headers) {
-  const current = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  const same = headers.every((header, index) => current[index] === header);
-  if (!same) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
-  sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e5e7eb");
-  const widths = [150, 150, 160, 150, 120, 90, 90, 90, 90, 100, 110, 230, 360, 110, 180, 120, 120, 120, 260];
-  for (let i = 0; i < headers.length; i++) sheet.setColumnWidth(i + 1, widths[i] || 140);
-}
-
-function styleInsertedRow(sheet, row, colCount) {
-  sheet.getRange(row, 1, 1, colCount).setVerticalAlignment("middle");
-  sheet.setRowHeight(row, 130);
-}
-
-function copyValidationAndFormat(ss, sourceCellA1, targetRange) {
-  const settingSheet = ss.getSheetByName(SETTING_SHEET_NAME);
-  if (!settingSheet) return;
-  const source = settingSheet.getRange(sourceCellA1);
-  source.copyTo(targetRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
-  source.copyTo(targetRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
-}
-
-function saveImageIfPresent(data, checkType, storeName, checkId) {
-  const base64 = data.imageBase64 || "";
-  if (!base64) return { hasImage: false, fileName: "", fileUrl: "", thumbnailFormula: "" };
-  const mimeType = data.mimeType || "image/jpeg";
-  const fileName = data.fileName || makeImageFileName(checkType, storeName, checkId);
-  const bytes = Utilities.base64Decode(base64);
-  const blob = Utilities.newBlob(bytes, mimeType, fileName);
-  const folder = DriveApp.getFolderById(FOLDER_ID);
-  const file = folder.createFile(blob);
-  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-  const fileUrl = file.getUrl();
-  const imageViewUrl = "https://lh3.googleusercontent.com/d/" + file.getId();
-  return {
-    hasImage: true,
-    fileName,
-    fileUrl,
-    thumbnailFormula: '=IMAGE("' + imageViewUrl + '", 1)',
-  };
-}
-
-function applyImageRichText(sheet, row, col, fileUrl) {
-  if (!fileUrl) return;
-  const richText = SpreadsheetApp.newRichTextValue().setText("画像を開く").setLinkUrl(fileUrl).build();
-  sheet.getRange(row, col).setRichTextValue(richText);
-}
-
-function calculateDaily(checks) {
-  const values = [checks.toilet, checks.seats, checks.kitchen, checks.entrance];
-  const ngCount = values.filter((value) => value === "NG").length;
-  const evaluation = ngCount === 0 ? "S" : ngCount === 1 ? "B" : "C";
-  const urgency = ngCount === 0 ? "C" : ngCount === 1 ? "B" : "S";
-  return { evaluation, urgency, ngCount };
-}
-
-function calculateWeekly(checks) {
-  const values = [checks.equipment, checks.interior, checks.flow].filter(Boolean);
-  const worst = worstGrade(values);
-  const evaluation = worst || "S";
-  const urgencyMap = { S: "C", A: "B", B: "A", C: "S" };
-  return { evaluation, urgency: urgencyMap[evaluation] || "C", hasC: values.includes("C") };
-}
-
-function worstGrade(values) {
-  const order = { S: 1, A: 2, B: 3, C: 4 };
-  let worst = "S";
-  values.forEach((value) => {
-    if ((order[value] || 99) > (order[worst] || 99)) worst = value;
-  });
-  return worst;
-}
-
-function shouldCreateRepair(checkType, calculation, memo, hasImage) {
-  if (checkType === "daily" && calculation.ngCount > 0) return true;
-  if (checkType === "weekly" && calculation.hasC) return true;
-  if (["S", "A"].includes(calculation.urgency) && memo && hasImage) return true;
-  return false;
-}
-
-function calculateDeadline(urgency, baseDate) {
-  const daysMap = { S: 0, A: 3, B: 7, C: 14 };
-  const days = daysMap[urgency] == null ? 7 : daysMap[urgency];
-  const date = new Date(baseDate.getTime());
-  date.setDate(date.getDate() + days);
-  return date;
-}
-
-function getOrCreateStoreSheet(ss, storeName) {
-  const safe = makeSafeSheetName(storeName);
-  let sheet = ss.getSheetByName(safe);
-  if (!sheet) sheet = ss.insertSheet(safe);
-  return sheet;
-}
-
-function getStoreNamesFromSpreadsheet(ss) {
-  return ss.getSheets().map((sheet) => sheet.getName()).filter((name) => name !== SETTING_SHEET_NAME);
-}
-
-function getSettingColumnValues(ss, headerName) {
-  const sheet = ss.getSheetByName(SETTING_SHEET_NAME);
-  if (!sheet) return [];
   const values = sheet.getDataRange().getValues();
-  if (!values.length) return [];
-  const headers = values[0].map((value) => String(value || "").trim());
-  const col = headers.indexOf(headerName);
-  if (col < 0) return [];
-  return values.slice(1).map((row) => String(row[col] || "").trim()).filter(Boolean);
+  const records = [];
+
+  // 想定列：
+  // A列：業態
+  // B列：エリア
+  // C列：店舗名
+  // D列以降：任意
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+
+    const businessType = row[0] ? String(row[0]).trim() : "";
+    const area = row[1] ? String(row[1]).trim() : "";
+    const storeName = row[2] ? String(row[2]).trim() : "";
+
+    if (!businessType || !storeName) {
+      continue;
+    }
+
+    records.push({
+      businessType: businessType,
+      area: area,
+      storeName: storeName,
+    });
+  }
+
+  return records;
 }
 
-function getValidationValues(ss, cellA1, fallback) {
-  const sheet = ss.getSheetByName(SETTING_SHEET_NAME);
-  if (!sheet) return fallback;
-  const rule = sheet.getRange(cellA1).getDataValidation();
-  if (!rule) return fallback;
-  const type = rule.getCriteriaType();
-  const values = rule.getCriteriaValues();
-  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
-    return values[0].map((value) => String(value).trim()).filter(Boolean);
+function getValidationValues(spreadsheet, cellA1, fallback) {
+  const sheet = spreadsheet.getSheetByName(SETTING_SHEET_NAME);
+  if (!sheet) {
+    return fallback;
   }
-  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
-    return values[0].getValues().flat().map((value) => String(value).trim()).filter(Boolean);
+
+  const range = sheet.getRange(cellA1);
+  const rule = range.getDataValidation();
+
+  if (!rule) {
+    const value = range.getValue();
+    if (value) {
+      return String(value)
+        .split(/[,\n、]/)
+        .map((v) => v.trim())
+        .filter(Boolean);
+    }
+    return fallback;
   }
+
+  const criteriaValues = rule.getCriteriaValues();
+  if (!criteriaValues || criteriaValues.length === 0) {
+    return fallback;
+  }
+
+  const first = criteriaValues[0];
+
+  // 直接リスト指定
+  if (Array.isArray(first)) {
+    return first.map((v) => String(v).trim()).filter(Boolean);
+  }
+
+  // 範囲参照
+  if (first && typeof first.getValues === "function") {
+    return first
+      .getValues()
+      .flat()
+      .map((v) => String(v).trim())
+      .filter(Boolean);
+  }
+
   return fallback;
 }
 
-function normalizeCheckType(value) {
-  if (value === "daily" || value === "日次") return "daily";
-  if (value === "weekly" || value === "週次") return "weekly";
-  throw new Error("チェック種別が不正です");
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents || "{}");
+    const result = saveCheckRecord(data);
+
+    return createJsonResponse({
+      ok: true,
+      result: result,
+    });
+  } catch (error) {
+    return createJsonResponse({
+      ok: false,
+      error: error.message,
+    });
+  }
 }
 
-function requiredText(value, label) {
-  const text = String(value || "").trim();
-  if (!text) throw new Error(label + "がありません");
-  return text;
+function saveCheckRecord(data) {
+  const checkType = String(data.checkType || "").trim(); // daily / weekly
+  const businessType = String(data.businessType || "").trim();
+  const area = String(data.area || "").trim();
+  const storeName = String(data.storeName || "").trim();
+  const staffName = String(data.staffName || "").trim();
+  const description = String(data.description || "").trim();
+  const note = String(data.note || "").trim();
+  const imageBase64 = data.imageBase64 || "";
+  const mimeType = data.mimeType || "image/jpeg";
+
+  if (!checkType) throw new Error("チェック種別がありません");
+  if (checkType !== "daily" && checkType !== "weekly") throw new Error("チェック種別が不正です");
+  if (!businessType) throw new Error("業態がありません");
+  if (!storeName) throw new Error("店舗名がありません");
+  if (!staffName) throw new Error("担当者がありません");
+
+  const now = new Date();
+  const checkId = makeCheckId(checkType, now);
+
+  let evaluation = "";
+  let urgency = "";
+  let repairNeeded = false;
+  let sheetId = "";
+  let header = [];
+  let row = [];
+
+  const savedImage = imageBase64
+    ? saveImageToDrive({
+        checkType: checkType,
+        storeName: storeName,
+        description: description,
+        imageBase64: imageBase64,
+        mimeType: mimeType,
+        fileName: data.fileName || "",
+      })
+    : {
+        fileName: "",
+        fileUrl: "",
+        imageViewUrl: "",
+        thumbnailFormula: "",
+      };
+
+  if (checkType === "daily") {
+    const toilet = String(data.toilet || "OK").trim();
+    const seats = String(data.seats || "OK").trim();
+    const kitchen = String(data.kitchen || "OK").trim();
+    const entrance = String(data.entrance || "OK").trim();
+
+    const dailyResult = calculateDailyResult({
+      toilet: toilet,
+      seats: seats,
+      kitchen: kitchen,
+      entrance: entrance,
+    });
+
+    evaluation = dailyResult.evaluation;
+    urgency = dailyResult.urgency;
+    repairNeeded = dailyResult.ngCount > 0;
+
+    sheetId = DAILY_SHEET_ID;
+    header = DAILY_HEADER;
+
+    row = [
+      checkId,
+      "", // 修繕へ登録ID。後で入れる
+      now,
+      storeName,
+      staffName,
+      toilet,
+      seats,
+      kitchen,
+      entrance,
+      evaluation,
+      urgency,
+      savedImage.fileName,
+      description,
+      savedImage.fileUrl ? "画像を開く" : "",
+      savedImage.thumbnailFormula,
+      "",
+      repairNeeded ? calculateDeadline(now, urgency) : "",
+      "",
+      note,
+    ];
+  }
+
+  if (checkType === "weekly") {
+    const equipment = String(data.equipment || "A").trim();
+    const interior = String(data.interior || "A").trim();
+    const flow = String(data.flow || "A").trim();
+
+    const weeklyResult = calculateWeeklyResult({
+      equipment: equipment,
+      interior: interior,
+      flow: flow,
+    });
+
+    evaluation = weeklyResult.evaluation;
+    urgency = weeklyResult.urgency;
+    repairNeeded =
+      weeklyResult.hasC ||
+      ((urgency === "S" || urgency === "A") && !!description && !!savedImage.fileUrl);
+
+    sheetId = WEEKLY_SHEET_ID;
+    header = WEEKLY_HEADER;
+
+    row = [
+      checkId,
+      "", // 修繕へ登録ID。後で入れる
+      now,
+      storeName,
+      staffName,
+      equipment,
+      interior,
+      flow,
+      evaluation,
+      urgency,
+      savedImage.fileName,
+      description,
+      savedImage.fileUrl ? "画像を開く" : "",
+      savedImage.thumbnailFormula,
+      "",
+      repairNeeded ? calculateDeadline(now, urgency) : "",
+      "",
+      note,
+    ];
+  }
+
+  // 修繕登録が必要な場合は先に修繕IDを作って2列目へ入れる
+  let repairId = "";
+  if (repairNeeded) {
+    repairId = makeRepairId(now);
+    row[1] = repairId;
+    row[14] = row[14] || savedImage.thumbnailFormula;
+    row[15] = "未対応";
+  }
+
+  const targetSS = SpreadsheetApp.openById(sheetId);
+  const targetSheet = getOutputSheet(targetSS, storeName);
+  ensureHeader(targetSheet, header);
+  applySheetFormats(targetSheet, checkType);
+
+  const nextRow = targetSheet.getLastRow() + 1;
+  targetSheet.getRange(nextRow, 1, 1, row.length).setValues([row]);
+
+  // 画像URLのリンク設定
+  if (savedImage.fileUrl) {
+    const imageUrlColumn = checkType === "daily" ? 14 : 13;
+    const richText = SpreadsheetApp.newRichTextValue()
+      .setText("画像を開く")
+      .setLinkUrl(savedImage.fileUrl)
+      .build();
+
+    targetSheet.getRange(nextRow, imageUrlColumn).setRichTextValue(richText);
+    targetSheet.setRowHeight(nextRow, 130);
+  }
+
+  if (repairNeeded) {
+    appendRepairRecord({
+      repairId: repairId,
+      checkId: checkId,
+      now: now,
+      storeName: storeName,
+      staffName: staffName,
+      checkType: checkType,
+      description: description,
+      fileUrl: savedImage.fileUrl,
+      thumbnailFormula: savedImage.thumbnailFormula,
+      urgency: urgency,
+      deadline: calculateDeadline(now, urgency),
+      note: note,
+    });
+  }
+
+  return {
+    checkId: checkId,
+    repairId: repairId,
+    repairNeeded: repairNeeded,
+    evaluation: evaluation,
+    urgency: urgency,
+    storeName: storeName,
+  };
 }
 
-function makeId(prefix, date) {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mi = String(date.getMinutes()).padStart(2, "0");
-  const ss = String(date.getSeconds()).padStart(2, "0");
-  const rand = String(Math.floor(Math.random() * 1000)).padStart(3, "0");
-  return prefix + "-" + yyyy + mm + dd + "-" + hh + mi + ss + "-" + rand;
+function saveImageToDrive(params) {
+  const now = new Date();
+  const fileName = params.fileName || makeImageFileName({
+    checkType: params.checkType,
+    storeName: params.storeName,
+    description: params.description,
+    date: now,
+  });
+
+  const bytes = Utilities.base64Decode(params.imageBase64);
+  const blob = Utilities.newBlob(bytes, params.mimeType || "image/jpeg", fileName);
+
+  const folder = DriveApp.getFolderById(FOLDER_ID);
+  const file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+  const fileUrl = file.getUrl();
+  const imageViewUrl = "https://lh3.googleusercontent.com/d/" + file.getId();
+  const thumbnailFormula = '=IMAGE("' + imageViewUrl + '", 1)';
+
+  return {
+    fileName: fileName,
+    fileUrl: fileUrl,
+    imageViewUrl: imageViewUrl,
+    thumbnailFormula: thumbnailFormula,
+  };
 }
 
-function makeImageFileName(checkType, storeName, checkId) {
-  return [checkType === "daily" ? "日次" : "週次", sanitizeFileText(storeName, 24), checkId].join("_") + ".jpg";
+function appendRepairRecord(params) {
+  const repairSS = SpreadsheetApp.openById(REPAIR_SHEET_ID);
+  const sheet = getOutputSheet(repairSS, params.storeName);
+  ensureHeader(sheet, REPAIR_HEADER);
+  applyRepairSheetFormats(sheet);
+
+  const row = [
+    params.repairId,
+    params.checkId,
+    params.now,
+    params.now,
+    params.storeName,
+    params.staffName,
+    params.checkType === "daily" ? "日次" : "週次",
+    params.description,
+    params.fileUrl ? "画像を開く" : "",
+    params.thumbnailFormula || "",
+    params.urgency,
+    "未対応",
+    params.deadline,
+    "",
+    "",
+    "",
+    params.note || "",
+  ];
+
+  const nextRow = sheet.getLastRow() + 1;
+  sheet.getRange(nextRow, 1, 1, row.length).setValues([row]);
+
+  if (params.fileUrl) {
+    const richText = SpreadsheetApp.newRichTextValue()
+      .setText("画像を開く")
+      .setLinkUrl(params.fileUrl)
+      .build();
+
+    sheet.getRange(nextRow, 9).setRichTextValue(richText);
+    sheet.setRowHeight(nextRow, 130);
+  }
+}
+
+function calculateDailyResult(values) {
+  const checks = [values.toilet, values.seats, values.kitchen, values.entrance];
+  const ngCount = checks.filter((v) => v === "NG").length;
+
+  if (ngCount === 0) {
+    return {
+      evaluation: "S",
+      urgency: "C",
+      ngCount: ngCount,
+    };
+  }
+
+  if (ngCount === 1) {
+    return {
+      evaluation: "B",
+      urgency: "B",
+      ngCount: ngCount,
+    };
+  }
+
+  return {
+    evaluation: "C",
+    urgency: "S",
+    ngCount: ngCount,
+  };
+}
+
+function calculateWeeklyResult(values) {
+  const grades = [values.equipment, values.interior, values.flow];
+  const order = {
+    S: 1,
+    A: 2,
+    B: 3,
+    C: 4,
+  };
+
+  let worst = "S";
+  grades.forEach((grade) => {
+    if ((order[grade] || 99) > (order[worst] || 99)) {
+      worst = grade;
+    }
+  });
+
+  const urgencyMap = {
+    S: "C",
+    A: "B",
+    B: "A",
+    C: "S",
+  };
+
+  return {
+    evaluation: worst,
+    urgency: urgencyMap[worst] || "B",
+    hasC: grades.includes("C"),
+  };
+}
+
+function calculateDeadline(date, urgency) {
+  const d = new Date(date);
+  const daysMap = {
+    S: 0,
+    A: 3,
+    B: 7,
+    C: 14,
+  };
+
+  const days = daysMap[urgency] !== undefined ? daysMap[urgency] : 7;
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function makeCheckId(checkType, date) {
+  const prefix = checkType === "daily" ? "D" : "W";
+  return prefix + "-" + Utilities.formatDate(date, "Asia/Tokyo", "yyyyMMdd-HHmmss-SSS");
+}
+
+function makeRepairId(date) {
+  return "R-" + Utilities.formatDate(date, "Asia/Tokyo", "yyyyMMdd-HHmmss-SSS");
+}
+
+function makeImageFileName(params) {
+  const typeText = params.checkType === "daily" ? "日次" : "週次";
+  const dateText = Utilities.formatDate(params.date, "Asia/Tokyo", "yyyyMMdd-HHmmss");
+  const store = sanitizeFileText(params.storeName || "店舗", 20);
+  const keyword = sanitizeFileText(extractKeyword(params.description || "写真"), 16);
+
+  return [typeText, store, dateText, keyword].join("_") + ".jpg";
+}
+
+function extractKeyword(text) {
+  const cleaned = sanitizeFileText(text, 80);
+  if (!cleaned) return "写真";
+
+  const commonPhrases = [
+    "が破損しているので業者対応が必要",
+    "が破損している",
+    "が汚れている",
+    "が壊れている",
+    "が故障している",
+    "の清掃が必要",
+    "清掃が必要",
+    "修繕が必要",
+    "業者対応が必要",
+    "対応が必要",
+    "してください",
+    "必要です",
+    "です",
+  ];
+
+  let keyword = cleaned;
+  commonPhrases.forEach((phrase) => {
+    keyword = keyword.replace(phrase, "");
+  });
+
+  const particleIndex = keyword.search(/[がをにはので]/);
+  if (particleIndex > 0) {
+    keyword = keyword.slice(0, particleIndex);
+  }
+
+  return sanitizeFileText(keyword || cleaned, 16);
 }
 
 function sanitizeFileText(text, maxLength) {
   return String(text || "")
     .replace(/[\s　]+/g, "")
-    .replace(/[\\/:*?\"<>|]/g, "")
+    .replace(/[\\/:*?"<>|]/g, "")
     .replace(/[。、，,.]/g, "")
     .slice(0, maxLength || 40);
 }
 
-function makeSafeSheetName(name) {
-  return String(name || "記録").replace(/[\\/?*[\]:]/g, "").slice(0, 80);
+function getOutputSheet(spreadsheet, storeName) {
+  const safeSheetName = makeSafeSheetName(storeName || "記録");
+  let sheet = spreadsheet.getSheetByName(safeSheetName);
+
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(safeSheetName);
+  }
+
+  return sheet;
 }
 
-function uniqueValues(values) {
-  return [...new Set(values.filter(Boolean))];
+function makeSafeSheetName(name) {
+  return String(name || "記録")
+    .replace(/[\\/?*[\]:]/g, "")
+    .slice(0, 80);
+}
+
+function ensureHeader(sheet, header) {
+  const firstRow = sheet.getRange(1, 1, 1, header.length).getValues()[0];
+  const hasHeader = firstRow.some((value) => value);
+
+  if (!hasHeader) {
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+    sheet.setFrozenRows(1);
+  }
+
+  sheet.getRange(1, 1, 1, header.length)
+    .setFontWeight("bold")
+    .setBackground("#e5e7eb");
+
+  sheet.autoResizeColumns(1, header.length);
+}
+
+function applySheetFormats(sheet, checkType) {
+  const maxRows = Math.max(sheet.getMaxRows(), 1000);
+  const ss = sheet.getParent();
+  const settingSheet = ss.getSheetByName(SETTING_SHEET_NAME);
+
+  if (!settingSheet) {
+    return;
+  }
+
+  if (checkType === "daily") {
+    // 日次：トイレ〜入口 D/G? 実際は F〜I列
+    copyValidationAndFormat(settingSheet, SETTING_DAILY_STATUS_CELL, sheet.getRange(2, 6, maxRows - 1, 4));
+    // 総合評価 J列、緊急度 K列
+    copyValidationAndFormat(settingSheet, SETTING_GRADE_CELL, sheet.getRange(2, 10, maxRows - 1, 2));
+    // 対応ステータス P列
+    copyValidationAndFormat(settingSheet, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 16, maxRows - 1, 1));
+  }
+
+  if (checkType === "weekly") {
+    // 週次：設備〜導線 F〜H列、総合評価 I列、緊急度 J列
+    copyValidationAndFormat(settingSheet, SETTING_GRADE_CELL, sheet.getRange(2, 6, maxRows - 1, 5));
+    // 対応ステータス O列
+    copyValidationAndFormat(settingSheet, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 15, maxRows - 1, 1));
+  }
+}
+
+function applyRepairSheetFormats(sheet) {
+  const maxRows = Math.max(sheet.getMaxRows(), 1000);
+  const dailySS = SpreadsheetApp.openById(DAILY_SHEET_ID);
+  const settingSheet = dailySS.getSheetByName(SETTING_SHEET_NAME);
+
+  if (!settingSheet) {
+    return;
+  }
+
+  // 優先度 K列
+  copyValidationAndFormat(settingSheet, SETTING_GRADE_CELL, sheet.getRange(2, 11, maxRows - 1, 1));
+  // 対応ステータス L列
+  copyValidationAndFormat(settingSheet, SETTING_REPAIR_STATUS_CELL, sheet.getRange(2, 12, maxRows - 1, 1));
+}
+
+function copyValidationAndFormat(templateSheet, templateCellA1, targetRange) {
+  const templateCell = templateSheet.getRange(templateCellA1);
+
+  templateCell.copyTo(
+    targetRange,
+    SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION,
+    false
+  );
+
+  templateCell.copyTo(
+    targetRange,
+    SpreadsheetApp.CopyPasteType.PASTE_FORMAT,
+    false
+  );
 }
 
 function createJsonResponse(payload) {
-  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+  return ContentService
+    .createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
+// 初回セットアップ用：手動で1回実行
 function setupAllSheets() {
-  setupWorkbook(DAILY_SHEET_ID, DAILY_HEADERS, "daily");
-  setupWorkbook(WEEKLY_SHEET_ID, WEEKLY_HEADERS, "weekly");
-  setupRepairWorkbook();
+  setupSettingSheet(SpreadsheetApp.openById(DAILY_SHEET_ID));
+  setupSettingSheet(SpreadsheetApp.openById(WEEKLY_SHEET_ID));
+  setupSettingSheet(SpreadsheetApp.openById(REPAIR_SHEET_ID));
+
+  const dailySS = SpreadsheetApp.openById(DAILY_SHEET_ID);
+  const weeklySS = SpreadsheetApp.openById(WEEKLY_SHEET_ID);
+  const repairSS = SpreadsheetApp.openById(REPAIR_SHEET_ID);
+
+  ensureHeader(getOutputSheet(dailySS, "サンプル"), DAILY_HEADER);
+  ensureHeader(getOutputSheet(weeklySS, "サンプル"), WEEKLY_HEADER);
+  ensureHeader(getOutputSheet(repairSS, "サンプル"), REPAIR_HEADER);
 }
 
-function setupWorkbook(spreadsheetId, headers, type) {
-  const ss = SpreadsheetApp.openById(spreadsheetId);
-  ensureSettingSheet(ss);
-  ss.getSheets().forEach((sheet) => {
-    if (sheet.getName() === SETTING_SHEET_NAME) return;
-    ensureCheckHeader(sheet, headers, type);
-  });
-}
+function setupSettingSheet(spreadsheet) {
+  let sheet = spreadsheet.getSheetByName(SETTING_SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SETTING_SHEET_NAME);
+  }
 
-function setupRepairWorkbook() {
-  const ss = SpreadsheetApp.openById(REPAIR_SHEET_ID);
-  ensureSettingSheet(ss);
-  ss.getSheets().forEach((sheet) => {
-    if (sheet.getName() === SETTING_SHEET_NAME) return;
-    ensureRepairHeader(sheet);
-  });
-}
+  sheet.getRange("A1").setValue("S");
+  sheet.getRange("B1").setValue("OK");
+  sheet.getRange("C1").setValue("未対応");
 
-function ensureSettingSheet(ss) {
-  let sheet = ss.getSheetByName(SETTING_SHEET_NAME);
-  if (!sheet) sheet = ss.insertSheet(SETTING_SHEET_NAME);
-  const urgencyRule = SpreadsheetApp.newDataValidation().requireValueInList(["S", "A", "B", "C"], true).build();
-  const dailyRule = SpreadsheetApp.newDataValidation().requireValueInList(["OK", "NG"], true).build();
-  const statusRule = SpreadsheetApp.newDataValidation().requireValueInList(["未対応", "対応中", "完了"], true).build();
-  sheet.getRange(SETTING_URGENCY_CELL).setValue("S").setDataValidation(urgencyRule);
-  sheet.getRange(SETTING_DAILY_STATUS_CELL).setValue("OK").setDataValidation(dailyRule);
-  sheet.getRange(SETTING_REPAIR_STATUS_CELL).setValue(DEFAULT_REPAIR_STATUS).setDataValidation(statusRule);
-  sheet.getRange("A1:C1").setFontWeight("bold").setBackground("#f1f5f9");
+  const gradeRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["S", "A", "B", "C"], true)
+    .setAllowInvalid(false)
+    .build();
+
+  const dailyRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["OK", "NG"], true)
+    .setAllowInvalid(false)
+    .build();
+
+  const repairStatusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["未対応", "対応中", "完了"], true)
+    .setAllowInvalid(false)
+    .build();
+
+  sheet.getRange("A1").setDataValidation(gradeRule);
+  sheet.getRange("B1").setDataValidation(dailyRule);
+  sheet.getRange("C1").setDataValidation(repairStatusRule);
+
+  sheet.getRange("A1:C1")
+    .setFontWeight("bold")
+    .setBackground("#e5e7eb");
+
+  sheet.setColumnWidth(1, 120);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 160);
 }
